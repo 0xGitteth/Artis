@@ -1,35 +1,59 @@
-# Artes
+# Exhibit App (Vite + Firebase)
 
-Een Vite + React applicatie met een eenvoudige Node/Express-backend.
+Productieklare React/Vite-app met Tailwind, Firebase Auth en Firestore. De app ondersteunt registratie/login, profielbeheer, posts met likes/comments en gevoelige-content voorkeuren.
 
-## Ontwikkeling
+## Vereisten
+- Node 20
+- Firebase project met Firestore en Authentication (email/wachtwoord)
+- Vite environment variabelen:
+  - `VITE_FIREBASE_API_KEY`
+  - `VITE_FIREBASE_AUTH_DOMAIN`
+  - `VITE_FIREBASE_PROJECT_ID`
+  - `VITE_FIREBASE_STORAGE_BUCKET`
+  - `VITE_FIREBASE_MESSAGING_SENDER_ID`
+  - `VITE_FIREBASE_APP_ID`
 
-1. Installeer afhankelijkheden: `npm install`.
-2. Start de backend: `npm start` (standaard op poort 5000).
-3. Start de frontend in een tweede terminal: `npm run dev` (Vite proxy't `/api` automatisch naar poort 5000).
-4. Open http://localhost:5173 in je browser.
-
-### Beschikbare API-routes
-- `GET /api/health` – eenvoudige health-check met uptime en timestamp.
-- `GET /api/posts` – levert demo-posts uit de lokale datastore.
-
-## Productie
-
-1. Build de frontend: `npm run build` (output in `dist/`).
-2. Start de server: `npm start` (serveert API-routes en statische assets).
-
-## Docker
-
-Een multi-stage Dockerfile is beschikbaar:
-
+## Ontwikkelen
 ```bash
-# bouwen
-npm ci
+npm install
+npm run dev
+```
+Open http://localhost:5173. De backend luistert op `process.env.PORT` (standaard 5000) via `npm start`.
+
+## Build & testen
+```bash
 npm run build
-# of via Docker
-DOCKER_BUILDKIT=1 docker build -t artes .
-# draaien
-docker run -p 5000:5000 artes
+npm start # serveert dist + API op ${PORT:-5000}
 ```
 
-De container serveert de backend op poort 5000 en levert tegelijkertijd de gecompileerde frontend-bestanden vanuit `dist/`.
+## Firestore security rules
+De benodigde regels staan in `firestore.rules`.
+Deploy ze met de Firebase CLI:
+```bash
+firebase init firestore # indien nog niet gedaan
+firebase deploy --only firestore:rules
+```
+
+## Docker/Sliplane
+De app draait in één container met Node/Express.
+
+```bash
+docker build -t exhibit-app .
+docker run -p 5000:5000 \
+  -e PORT=5000 \
+  -e VITE_FIREBASE_API_KEY=... \
+  -e VITE_FIREBASE_AUTH_DOMAIN=... \
+  -e VITE_FIREBASE_PROJECT_ID=... \
+  -e VITE_FIREBASE_STORAGE_BUCKET=... \
+  -e VITE_FIREBASE_MESSAGING_SENDER_ID=... \
+  -e VITE_FIREBASE_APP_ID=... \
+  exhibit-app
+```
+
+### Sliplane deploy stappen
+1. Maak een nieuw Firebase project en haal de webconfig op.
+2. Zet bovenstaande Vite-variabelen als Secrets/Env vars in Sliplane.
+3. Build stap: `npm ci && npm run build`.
+4. Run stap: `npm ci --omit=dev && node server/index.js` (container luistert op `$PORT`).
+5. Optioneel: deploy Firestore rules met de Firebase CLI voordat je live gaat.
+
