@@ -327,10 +327,12 @@ export default function ExhibitApp() {
       linkedAgencyName: profileData.linkedAgencyName,
       linkedCompanyName: profileData.linkedCompanyName,
     };
-    const saved = await saveProfileApi(finalProfile);
-    if (authUser?.uid) {
-      await createProfile(authUser.uid, saved || finalProfile);
-    }
+      const saved = await saveProfileApi(finalProfile);
+      if (authUser?.uid) {
+        createProfile(authUser.uid, saved || finalProfile).catch((error) => {
+          console.error('Failed to sync profile to Firestore', error);
+        });
+      }
     setProfile(saved);
     setView('gallery');
     startTour();
