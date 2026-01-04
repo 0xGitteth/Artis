@@ -753,6 +753,7 @@ function UploadModal({ onClose, user, profile, users }) {
   const [isSensitive, setIsSensitive] = useState(false);
   const [activeTriggers, setActiveTriggers] = useState([]);
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState('');
   const [uploaderRole, setUploaderRole] = useState(defaultRole);
   const [errors, setErrors] = useState({});
   const [publishing, setPublishing] = useState(false);
@@ -768,18 +769,81 @@ function UploadModal({ onClose, user, profile, users }) {
   const handleFile = (e) => {
     if (e.target.files[0]) {
       const r = new FileReader();
-      r.onload = ev => { setImage(ev.target.result); setStep(2); setErrors(prev => ({ ...prev, image: undefined })); };
+      r.onload = ev => {
+        setImage(ev.target.result);
+        setStep(2);
+        setErrors(prev => ({ ...prev, image: undefined }));
+        setAiError('');
+        setIsSensitive(false);
+        setActiveTriggers([]);
+      };
       r.readAsDataURL(e.target.files[0]);
     }
   };
 
-  const simulateAI = () => {
+  const runAICheck = async () => {
+    if (!image) {
+      setErrors((prev) => ({ ...prev, image: 'Voeg eerst een afbeelding toe voor de AI-scan.' }));
+      return;
+    }
+
+    const moderationEndpoint = import.meta.env.VITE_MODERATION_FUNCTION_URL;
+    if (!moderationEndpoint) {
+      setAiError('Geen AI-endpoint ingesteld. Voeg VITE_MODERATION_FUNCTION_URL toe aan je omgeving.');
+      return;
+    }
+
     setAiLoading(true);
-    setTimeout(() => {
-        setIsSensitive(true);
-        setActiveTriggers(['Naakt (Artistiek)']);
-        setAiLoading(false);
-    }, 1500);
+    setAiError('');
+
+    try {
+      const response = await fetch(moderationEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image }),
+      });
+
+      if (!response.ok) {
+        throw new Error('AI-service gaf een fout terug.');
+      }
+
+      const data = await response.json();
+      const labels = Array.isArray(data.labels) ? data.labels : [];
+
+      const normalizedTriggers = TRIGGERS.map((label) => ({
+        original: label,
+        normalized: label.toLowerCase(),
+      }));
+
+      const detectedTriggers = labels.reduce((acc, label) => {
+        const name = (label?.name || label?.label || '').toLowerCase();
+        const confidence = Number(label?.confidence ?? label?.score ?? 0);
+        const matched = normalizedTriggers.find(
+          (trigger) =>
+            name.includes(trigger.normalized) || trigger.normalized.includes(name)
+        );
+
+        if (matched && confidence >= 0.5 && !acc.includes(matched.original)) {
+          acc.push(matched.original);
+        }
+
+        return acc;
+      }, []);
+
+      const sensitiveFlag = typeof data.isSensitive === 'boolean'
+        ? data.isSensitive
+        : detectedTriggers.length > 0;
+
+      setIsSensitive(sensitiveFlag);
+      setActiveTriggers(detectedTriggers);
+    } catch (error) {
+      console.error('AI check failed', error);
+      setAiError('AI-check mislukt. Probeer het opnieuw.');
+      setIsSensitive(false);
+      setActiveTriggers([]);
+    } finally {
+      setAiLoading(false);
+    }
   };
 
   const addCredit = (foundUser) => {
@@ -871,9 +935,19 @@ function UploadModal({ onClose, user, profile, users }) {
                          {isSensitive && <div className="absolute inset-0 bg-slate-900/80 flex items-center justify-center text-orange-400 font-bold"><AlertOctagon className="w-6 h-6 mr-2"/> Sensitive Content</div>}
                       </div>
                       {errors.image && <p className="text-xs text-red-500">{errors.image}</p>}
-                      <div className="bg-slate-50 p-4 rounded-xl border">
-                         <div className="flex justify-between items-center mb-3"><span className="text-sm font-bold flex items-center gap-2 dark:text-white"><Shield className="w-4 h-4"/> Safety Check</span><button onClick={simulateAI} className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">{aiLoading ? '...' : 'AI Scan'}</button></div>
+                      <div className="bg-slate-50 p-4 rounded-xl border dark:bg-slate-800 dark:border-slate-700">
+                         <div className="flex justify-between items-center mb-3">
+                            <span className="text-sm font-bold flex items-center gap-2 dark:text-white"><Shield className="w-4 h-4"/> Safety Check</span>
+                            <button
+                              onClick={runAICheck}
+                              disabled={aiLoading}
+                              className="text-xs bg-blue-100 text-blue-700 px-3 py-1 rounded flex items-center gap-1 disabled:opacity-60"
+                            >
+                              {aiLoading && <Loader2 className="w-3 h-3 animate-spin" />}AI Scan
+                            </button>
+                         </div>
                          <label className="flex items-center gap-2 text-sm cursor-pointer dark:text-white"><input type="checkbox" checked={isSensitive} onChange={e => setIsSensitive(e.target.checked)} /> Markeer als gevoelig</label>
+                         {aiError && <p className="text-xs text-red-500 mt-2">{aiError}</p>}
                          {isSensitive && <div className="flex flex-wrap gap-2 mt-2">{TRIGGERS.map(t => <button key={t} onClick={() => setActiveTriggers(p => p.includes(t) ? p.filter(x => x !== t) : [...p, t])} className={`text-[10px] px-2 py-1 rounded border ${activeTriggers.includes(t) ? 'bg-orange-100 text-orange-800' : ''}`}>{t}</button>)}</div>}
                       </div>
                    </div>

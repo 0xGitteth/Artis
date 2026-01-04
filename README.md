@@ -12,6 +12,7 @@ Productieklare React/Vite-app met Tailwind, Firebase Auth en Firestore. De app o
   - `VITE_FIREBASE_STORAGE_BUCKET`
   - `VITE_FIREBASE_MESSAGING_SENDER_ID`
   - `VITE_FIREBASE_APP_ID`
+  - `VITE_MODERATION_FUNCTION_URL`
 
 ## Ontwikkelen
 ```bash
@@ -47,6 +48,7 @@ docker run -p 5000:5000 \
   -e VITE_FIREBASE_STORAGE_BUCKET=... \
   -e VITE_FIREBASE_MESSAGING_SENDER_ID=... \
   -e VITE_FIREBASE_APP_ID=... \
+  -e VITE_MODERATION_FUNCTION_URL=... \
   artes-app
 ```
 
