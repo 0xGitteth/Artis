@@ -5,7 +5,7 @@ import { Button } from './ui';
 const PREFERENCES = [
   { id: 'cover', label: 'Cover', desc: 'toon blur overlay en laat gebruiker het openen' },
   { id: 'show', label: 'Show', desc: 'altijd tonen' },
-  { id: 'block', label: 'Block', desc: 'verberg gevoelige posts' },
+  { id: 'hideFeed', label: 'Hide feed', desc: 'verberg gevoelige posts' },
 ];
 
 export default function SettingsModal({ onClose, darkMode, onToggleDark, preference, onPreferenceChange, onLogout }) {
@@ -63,4 +63,3 @@ export default function SettingsModal({ onClose, darkMode, onToggleDark, prefere
     </div>
   );
 }
-
