@@ -1,0 +1,13 @@
+{
+  "name": "artes-functions",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "18"
+  },
+  "dependencies": {
+    "@google-cloud/vertexai": "^1.0.0",
+    "@google-cloud/vision": "^4.2.1",
+    "firebase-functions": "^4.5.0"
+  }
+}
