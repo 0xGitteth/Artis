@@ -22,11 +22,15 @@ const TRIGGER_LABELS = {
   spidersInsects: 'Spinnen / insecten',
 };
 
-export default function PostCard({ post, onClick, onToggleLike, liked }) {
+export default function PostCard({ post, onClick, onToggleLike, liked, contentPreference, onReveal }) {
   const { title, imageUrl, authorName, styles = [], likes = 0, commentsCount = 0, triggers = [], appliedTriggers = [], makerTags = [] } = post;
-  const sensitiveFlag = post.sensitive || appliedTriggers.length > 0 || makerTags.length > 0;
+  const sensitiveFlag = post.sensitive || appliedTriggers.length > 0 || makerTags.length > 0 || triggers.length > 0;
   const resolvedTriggers = Array.from(new Set([...appliedTriggers, ...makerTags, ...triggers]))
     .map((trigger) => TRIGGER_LABELS[trigger] || trigger);
+  const effectivePreference = contentPreference ?? (sensitiveFlag ? 'cover' : 'show');
+  const shouldCover = sensitiveFlag && effectivePreference === 'cover';
+
+  if (effectivePreference === 'hideFeed') return null;
 
   return (
     <div
@@ -34,10 +38,19 @@ export default function PostCard({ post, onClick, onToggleLike, liked }) {
       className="group bg-white dark:bg-slate-900/50 border border-slate-200 dark:border-slate-800 rounded-3xl overflow-hidden shadow-xl shadow-slate-900/5 hover:-translate-y-1 transition-all cursor-pointer"
     >
       <div className="relative">
-        {sensitiveFlag && (
+        {shouldCover && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-slate-900/60 text-white">
             <p className="font-semibold">Gevoelige content</p>
-            <p className="text-sm opacity-80">Klik om te bekijken</p>
+            <button
+              type="button"
+              className="mt-2 text-sm opacity-90 underline"
+              onClick={(event) => {
+                event.stopPropagation();
+                onReveal?.();
+              }}
+            >
+              Klik om te bekijken
+            </button>
           </div>
         )}
         <img src={imageUrl} alt={title} className="h-60 w-full object-cover" />

@@ -115,13 +115,50 @@ const TRIGGERS = [
   { id: 'spidersInsects', label: 'Spinnen / insecten' },
 ];
 
+const TRIGGER_PREFERENCE_OPTIONS = [
+  { id: 'show', label: 'Show', desc: 'Direct tonen' },
+  { id: 'cover', label: 'Cover', desc: 'Cover overlay tonen' },
+  { id: 'hideFeed', label: 'Hide feed', desc: 'Post verbergen in de feed' },
+];
+
 const buildDefaultAvatar = (seed) =>
   `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(seed || 'artes')}`;
+
+const normalizeTriggerPreferences = (triggerVisibility = {}) => {
+  const normalized = { ...triggerVisibility };
+  TRIGGERS.forEach((trigger) => {
+    const stored = triggerVisibility?.[trigger.id];
+    normalized[trigger.id] = TRIGGER_PREFERENCE_OPTIONS.some((opt) => opt.id === stored) ? stored : 'cover';
+  });
+  return normalized;
+};
+
+const resolveTriggerKey = (trigger) => {
+  const match = TRIGGERS.find((item) => item.id === trigger || item.label === trigger);
+  return match ? match.id : trigger;
+};
+
+const getPostTriggerKeys = (post) => {
+  const triggers = [...(post.appliedTriggers || []), ...(post.makerTags || []), ...(post.triggers || [])];
+  const resolved = triggers.map(resolveTriggerKey);
+  return Array.from(new Set(resolved));
+};
+
+const getPostContentPreference = (post, triggerVisibility) => {
+  const triggers = getPostTriggerKeys(post);
+  if (!triggers.length) return 'show';
+  const preferences = triggers.map((trigger) => triggerVisibility?.[trigger] || 'cover');
+  if (preferences.includes('hideFeed')) return 'hideFeed';
+  if (preferences.includes('cover')) return 'cover';
+  return 'show';
+};
 
 const normalizeProfileData = (profileData = {}, fallbackSeed = 'artes') => {
   const seed = profileData?.uid || profileData?.displayName || fallbackSeed;
   const roles = Array.isArray(profileData?.roles) && profileData.roles.length ? profileData.roles : ['fan'];
   const themes = Array.isArray(profileData?.themes) && profileData.themes.length ? profileData.themes : ['General'];
+  const triggerVisibility = normalizeTriggerPreferences(profileData?.preferences?.triggerVisibility);
+  const themePreference = profileData?.preferences?.theme || 'light';
 
   return {
     ...profileData,
@@ -135,6 +172,11 @@ const normalizeProfileData = (profileData = {}, fallbackSeed = 'artes') => {
     linkedCompanyName: profileData?.linkedCompanyName ?? null,
     linkedAgencyLink: profileData?.linkedAgencyLink ?? '',
     linkedCompanyLink: profileData?.linkedCompanyLink ?? '',
+    preferences: {
+      ...profileData?.preferences,
+      triggerVisibility,
+      theme: themePreference,
+    },
   };
 };
 
@@ -309,6 +351,11 @@ export default function ArtesApp() {
     bootstrap();
   }, []);
 
+  useEffect(() => {
+    if (!profile?.preferences?.theme) return;
+    setDarkMode(profile.preferences.theme === 'dark');
+  }, [profile?.preferences?.theme]);
+
   // Data Listeners
   useEffect(() => {
      if (!user) return;
@@ -395,6 +442,11 @@ export default function ArtesApp() {
       avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${authUser?.uid || 'artes'}`,
       linkedAgencyName: profileData.linkedAgencyName,
       linkedCompanyName: profileData.linkedCompanyName,
+      preferences: {
+        ...profileData.preferences,
+        triggerVisibility: normalizeTriggerPreferences(profileData.preferences?.triggerVisibility),
+        theme: profileData.preferences?.theme || 'light',
+      },
     };
       const saved = await saveProfileApi(finalProfile);
       if (authUser?.uid) {
@@ -405,6 +457,7 @@ export default function ArtesApp() {
     const normalized = normalizeProfileData(saved || finalProfile, authUser?.uid);
     setProfile(normalized);
     persistProfile(normalized);
+    setDarkMode((saved || finalProfile)?.preferences?.theme === 'dark');
     setView('gallery');
     setShowTour(true);
   };
@@ -543,7 +596,10 @@ function Onboarding({ setView, users, onSignup, onCompleteProfile, authUser, aut
     const [step, setStep] = useState(1);
     const [roles, setRoles] = useState([]);
     const [profileData, setProfileData] = useState({
-       displayName: '', bio: '', insta: '', linkedAgencyName: '', linkedCompanyName: ''
+       displayName: '', bio: '', insta: '', linkedAgencyName: '', linkedCompanyName: '', preferences: {
+         triggerVisibility: normalizeTriggerPreferences(),
+         theme: 'light',
+       },
     });
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
@@ -566,13 +622,13 @@ function Onboarding({ setView, users, onSignup, onCompleteProfile, authUser, aut
 
     if (step === 1) return (
       <div className="max-w-md mx-auto py-12 px-4 animate-in slide-in-from-right duration-300">
-        <h2 className="text-sm font-bold text-blue-600 uppercase tracking-wide mb-1">Stap 1/4</h2>
+        <h2 className="text-sm font-bold text-blue-600 uppercase tracking-wide mb-1">Stap 1/5</h2>
         <h1 className="text-3xl font-bold text-slate-900 dark:text-white mb-4">Welkom bij Artes</h1>
         <p className="text-slate-600 dark:text-slate-400 mb-8">Maak een account aan om te beginnen.</p>
         <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl shadow-sm border border-slate-200 dark:border-slate-700">
           <Input label="E-mailadres" value={email} onChange={(e) => setEmail(e.target.value)} />
           <Input label="Wachtwoord" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-          <Input label="Weergavenaam" value={profileData.displayName} onChange={e => setProfileData({...profileData, displayName: e.target.value})} />
+          <Input label="Echte naam (volledige naam)" value={profileData.displayName} onChange={e => setProfileData({...profileData, displayName: e.target.value})} />
           {(error || authError) && <p className="text-sm text-red-500">{error || authError}</p>}
           <Button onClick={async () => {
               try {
@@ -595,7 +651,7 @@ function Onboarding({ setView, users, onSignup, onCompleteProfile, authUser, aut
 
     if (step === 2) return (
       <div className="max-w-lg mx-auto py-12 px-4 animate-in slide-in-from-right duration-300">
-        <h2 className="text-sm font-bold text-blue-600 uppercase mb-1">Stap 2/4</h2>
+        <h2 className="text-sm font-bold text-blue-600 uppercase mb-1">Stap 2/5</h2>
         <h1 className="text-3xl font-bold dark:text-white mb-6">Veiligheid & Waarden</h1>
         <div className="bg-white dark:bg-slate-800 p-8 rounded-2xl shadow-sm border dark:border-slate-700 space-y-6">
            <div className="flex gap-3"><Shield className="text-blue-500"/><p className="text-sm dark:text-slate-300">Bij Artes staan respect en consent centraal.</p></div>
@@ -607,7 +663,7 @@ function Onboarding({ setView, users, onSignup, onCompleteProfile, authUser, aut
 
     if (step === 3) return (
       <div className="max-w-2xl mx-auto py-12 px-4 animate-in slide-in-from-right duration-300">
-        <h2 className="text-sm font-bold text-blue-600 uppercase mb-1">Stap 3/4</h2>
+        <h2 className="text-sm font-bold text-blue-600 uppercase mb-1">Stap 3/5</h2>
         <h1 className="text-3xl font-bold dark:text-white mb-6">Kies je rol(len)</h1>
         <div className="grid grid-cols-2 gap-4 mb-8 h-96 overflow-y-auto no-scrollbar">
           {ROLES.map(r => (
@@ -623,7 +679,7 @@ function Onboarding({ setView, users, onSignup, onCompleteProfile, authUser, aut
 
     if (step === 4) return (
       <div className="max-w-lg mx-auto py-12 px-4 animate-in slide-in-from-right duration-300">
-        <h2 className="text-sm font-bold text-blue-600 uppercase mb-1">Stap 4/4</h2>
+        <h2 className="text-sm font-bold text-blue-600 uppercase mb-1">Stap 4/5</h2>
         <h1 className="text-3xl font-bold dark:text-white mb-6">Maak je profiel af</h1>
         <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border dark:border-slate-700 space-y-4">
           <Input label="Weergavenaam" value={profileData.displayName} onChange={e => setProfileData({...profileData, displayName: e.target.value})} />
@@ -639,9 +695,93 @@ function Onboarding({ setView, users, onSignup, onCompleteProfile, authUser, aut
                  <input className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white" placeholder="Naam Bedrijf" value={profileData.linkedCompanyName} onChange={e => setProfileData({...profileData, linkedCompanyName: e.target.value})} />
              </div>
           </div>
+          <Button className="w-full mt-4" onClick={() => setStep(5)}>Volgende</Button>
+        </div>
+      </div>
+    );
+
+    if (step === 5) return (
+      <div className="max-w-lg mx-auto py-12 px-4 animate-in slide-in-from-right duration-300">
+        <h2 className="text-sm font-bold text-blue-600 uppercase mb-1">Stap 5/5</h2>
+        <h1 className="text-3xl font-bold dark:text-white mb-6">Appvoorkeuren</h1>
+        <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl border dark:border-slate-700 space-y-6">
+          <div className="space-y-3">
+            <div>
+              <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">Thema</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">Kies de weergave van de app.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                { id: 'light', label: 'Light' },
+                { id: 'dark', label: 'Dark' },
+              ].map((opt) => (
+                <button
+                  type="button"
+                  key={opt.id}
+                  onClick={() =>
+                    setProfileData((prev) => ({
+                      ...prev,
+                      preferences: {
+                        ...prev.preferences,
+                        theme: opt.id,
+                      },
+                    }))
+                  }
+                  className={`p-4 rounded-2xl border text-left transition ${
+                    (profileData.preferences?.theme || 'light') === opt.id
+                      ? 'border-blue-300 bg-blue-50 dark:border-blue-800/80 dark:bg-blue-900/20 text-blue-800 dark:text-blue-100'
+                      : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  <p className="font-semibold">{opt.label}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">Trigger voorkeuren</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">Kies hoe je gevoelige content per trigger wilt zien.</p>
+            </div>
+            <div className="space-y-3">
+              {TRIGGERS.map((trigger) => (
+                <div key={trigger.id} className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 space-y-2">
+                  <p className="text-sm font-medium text-slate-800 dark:text-slate-200">{trigger.label}</p>
+                  <div className="flex flex-wrap gap-2">
+                    {TRIGGER_PREFERENCE_OPTIONS.map((opt) => (
+                      <button
+                        type="button"
+                        key={opt.id}
+                        onClick={() =>
+                          setProfileData((prev) => ({
+                            ...prev,
+                            preferences: {
+                              ...prev.preferences,
+                              triggerVisibility: {
+                                ...prev.preferences?.triggerVisibility,
+                                [trigger.id]: opt.id,
+                              },
+                            },
+                          }))
+                        }
+                        className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all ${
+                          (profileData.preferences?.triggerVisibility?.[trigger.id] || 'cover') === opt.id
+                            ? 'bg-blue-600 text-white border-blue-600'
+                            : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
 
           {error && <p className="text-sm text-red-500">{error}</p>}
-          <Button className="w-full mt-4" disabled={!accountCreated || pending || roles.length === 0} onClick={async () => {
+          <Button className="w-full" disabled={!accountCreated || pending || roles.length === 0} onClick={async () => {
               try {
                 setPending(true);
                 setError(null);
@@ -659,20 +799,19 @@ function Onboarding({ setView, users, onSignup, onCompleteProfile, authUser, aut
 
 function Gallery({ posts, onUserClick, profile, onChallengeClick, onPostClick, onShadowClick }) {
   const [sensitiveRevealed, setSensitiveRevealed] = useState({});
-  const preference = profile?.preferences?.sensitiveContent || 'cover';
-  const isSensitivePost = (post) => post.sensitive || (post.appliedTriggers || []).length > 0 || (post.makerTags || []).length > 0;
-  const visiblePosts = posts.filter(p => {
-     if (!isSensitivePost(p)) return true;
-     if (preference === 'block') return false; 
-     return true;
-  });
+  const triggerVisibility = profile?.preferences?.triggerVisibility || normalizeTriggerPreferences();
+  const isSensitivePost = (post) => getPostTriggerKeys(post).length > 0;
+  const visiblePosts = posts.filter((post) => getPostContentPreference(post, triggerVisibility) !== 'hideFeed');
 
   return (
     <div className="max-w-2xl mx-auto px-4 py-6 space-y-12">
-      {visiblePosts.map(post => (
+      {visiblePosts.map((post) => {
+        const contentPreference = getPostContentPreference(post, triggerVisibility);
+        const shouldCover = isSensitivePost(post) && contentPreference === 'cover' && !sensitiveRevealed[post.id];
+        return (
         <div key={post.id} className="relative group">
            <div className={`relative overflow-hidden rounded-sm bg-slate-200 dark:bg-slate-800 min-h-[300px] shadow-sm cursor-pointer ${post.isChallenge ? 'ring-4 ring-amber-400' : ''}`} onClick={() => onPostClick(post)}>
-             {(isSensitivePost(post) && !sensitiveRevealed[post.id] && preference === 'cover') ? (
+             {shouldCover ? (
                 <div className="absolute inset-0 z-10 backdrop-blur-3xl bg-slate-900/80 flex flex-col items-center justify-center p-6 text-center" onClick={(e) => e.stopPropagation()}>
                    <AlertOctagon className="w-12 h-12 text-orange-500 mb-4" />
                    <h4 className="text-white font-bold text-lg mb-2">Gevoelige inhoud</h4>
@@ -703,7 +842,7 @@ function Gallery({ posts, onUserClick, profile, onChallengeClick, onPostClick, o
               </div>
            </div>
         </div>
-      ))}
+      );})}
     </div>
   );
 }
@@ -1293,7 +1432,14 @@ function EditProfileModal({ onClose, profile, user }) {
   const [tab, setTab] = useState('general');
   
   const handleSave = async () => {
-     await updateProfileData(user.uid, formData);
+     const payload = {
+       ...formData,
+       preferences: {
+         ...formData.preferences,
+         triggerVisibility: normalizeTriggerPreferences(formData.preferences?.triggerVisibility),
+       },
+     };
+     await updateProfileData(user.uid, payload);
      onClose();
   };
 
@@ -1304,7 +1450,15 @@ function EditProfileModal({ onClose, profile, user }) {
           <div className="flex-1 overflow-y-auto p-8 space-y-6">
              {/* Simple Tabs for this view */}
              <div className="flex gap-4 border-b mb-4">
-                 {['Algemeen', 'Rollen', 'Stijlen'].map(t => <button key={t} onClick={() => setTab(t.toLowerCase())} className={`pb-2 ${tab === t.toLowerCase() ? 'border-b-2 border-blue-600 font-bold' : ''}`}>{t}</button>)}
+                 {['Algemeen', 'Triggers', 'Rollen', 'Stijlen'].map(t => (
+                   <button
+                     key={t}
+                     onClick={() => setTab(t.toLowerCase())}
+                     className={`pb-2 ${tab === t.toLowerCase() ? 'border-b-2 border-blue-600 font-bold' : ''}`}
+                   >
+                     {t}
+                   </button>
+                 ))}
              </div>
 
              {tab === 'general' && (
@@ -1326,6 +1480,49 @@ function EditProfileModal({ onClose, profile, user }) {
                         </div>
                     </div>
                 </>
+             )}
+
+             {tab === 'triggers' && (
+               <div className="space-y-4">
+                 <div>
+                   <h4 className="font-bold text-slate-800 dark:text-white">Trigger voorkeuren</h4>
+                   <p className="text-sm text-slate-500 dark:text-slate-400">Beheer per trigger hoe de feed het toont.</p>
+                 </div>
+                 <div className="space-y-3">
+                   {TRIGGERS.map((trigger) => (
+                     <div key={trigger.id} className="rounded-xl border border-slate-200 dark:border-slate-700 p-4 space-y-2">
+                       <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">{trigger.label}</p>
+                       <div className="flex flex-wrap gap-2">
+                         {TRIGGER_PREFERENCE_OPTIONS.map((opt) => (
+                           <button
+                             type="button"
+                             key={opt.id}
+                             onClick={() =>
+                               setFormData((prev) => ({
+                                 ...prev,
+                                 preferences: {
+                                   ...prev.preferences,
+                                   triggerVisibility: {
+                                     ...prev.preferences?.triggerVisibility,
+                                     [trigger.id]: opt.id,
+                                   },
+                                 },
+                               }))
+                             }
+                             className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-all ${
+                               (formData.preferences?.triggerVisibility?.[trigger.id] || 'cover') === opt.id
+                                 ? 'bg-blue-600 text-white border-blue-600'
+                                 : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                             }`}
+                           >
+                             {opt.label}
+                           </button>
+                         ))}
+                       </div>
+                     </div>
+                   ))}
+                 </div>
+               </div>
              )}
 
              {/* Placeholder for other tabs logic to keep file size manageable but show structure */}
