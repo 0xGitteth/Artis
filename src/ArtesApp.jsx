@@ -906,12 +906,7 @@ function UploadModal({ onClose, user, profile, users }) {
     return users.filter(u => u.displayName.toLowerCase().includes(contributorSearch.toLowerCase()));
   }, [users, contributorSearch]);
 
-  const toDataUrlSize = (dataUrl) => {
-    const commaIndex = dataUrl.indexOf(',');
-    if (commaIndex === -1) return dataUrl.length;
-    const base64 = dataUrl.slice(commaIndex + 1);
-    return Math.floor((base64.length * 3) / 4);
-  };
+  const toDataUrlSize = (dataUrl) => new TextEncoder().encode(dataUrl).length;
 
   const compressImage = (file) => new Promise((resolve, reject) => {
     const reader = new FileReader();
