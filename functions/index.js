@@ -36,6 +36,25 @@ if (!admin.apps.length) {
 const db = getFirestore();
 const lockDurationMs = 10 * 60 * 1000;
 
+const getAppIdFromEnv = () => {
+  const direct = process.env.FIREBASE_APP_ID;
+  if (direct) return direct;
+  const firebaseConfig = process.env.FIREBASE_CONFIG;
+  if (!firebaseConfig) return null;
+  try {
+    const parsed = JSON.parse(firebaseConfig);
+    return parsed?.appId || null;
+  } catch (error) {
+    return null;
+  }
+};
+
+const buildReportedPostPath = (postId) => {
+  const appId = getAppIdFromEnv();
+  if (!appId || !postId) return null;
+  return `artifacts/${appId}/public/data/posts/${postId}`;
+};
+
 const getTokenFromRequest = (req) => {
   const header = req.get('Authorization') || '';
   if (!header.startsWith('Bearer ')) return null;
@@ -776,6 +795,7 @@ export const reportPost = onRequest({ cors: true }, async (req, res) => {
     const normalizedContributors = Array.isArray(contributorUids)
       ? [...new Set(contributorUids.filter(Boolean))]
       : [];
+    const reportedPostPath = buildReportedPostPath(postId);
     let reportedFingerprints = null;
     try {
       reportedFingerprints = await buildFingerprintFromUrl(imageUrl);
@@ -795,6 +815,7 @@ export const reportPost = onRequest({ cors: true }, async (req, res) => {
         authorId: authorId || null,
         authorName: authorName || null,
       },
+      reportedPostPath: reportedPostPath || null,
       contributorUids: normalizedContributors,
       reportedFingerprints,
       reportedByUid: decoded.uid,
@@ -1034,8 +1055,10 @@ export const moderatorDecide = onRequest({ cors: true }, async (req, res) => {
     });
 
     if (caseType === 'report' && decision === 'approved' && reportPostId) {
+      const reportedPostPath = reviewSnapshotData?.reportedPostPath || buildReportedPostPath(reportPostId);
+      const deleteRef = reportedPostPath ? db.doc(reportedPostPath) : db.collection('posts').doc(reportPostId);
       try {
-        await db.collection('posts').doc(reportPostId).delete();
+        await deleteRef.delete();
       } catch (error) {
         logger.error('Reported post delete mislukt.', error);
       }
