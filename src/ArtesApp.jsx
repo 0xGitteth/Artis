@@ -2039,6 +2039,7 @@ function UploadModal({ onClose, user, profile, users }) {
   const [errors, setErrors] = useState({});
   const [publishing, setPublishing] = useState(false);
   const [publishError, setPublishError] = useState('');
+  const moderationEndpoint = import.meta.env.VITE_MODERATION_FUNCTION_URL;
 
   // Contributor search logic
   const [contributorSearch, setContributorSearch] = useState('');
@@ -2116,26 +2117,33 @@ function UploadModal({ onClose, user, profile, users }) {
     }
   };
 
-  const runAICheck = async () => {
+  const runAICheck = async ({ silent = false } = {}) => {
     if (!image) {
-      setErrors((prev) => ({ ...prev, image: 'Voeg eerst een afbeelding toe voor de AI-scan.' }));
-      return;
+      if (!silent) {
+        setErrors((prev) => ({ ...prev, image: 'Voeg eerst een afbeelding toe voor de AI-scan.' }));
+      }
+      return null;
     }
 
-    const moderationEndpoint = import.meta.env.VITE_MODERATION_FUNCTION_URL;
     if (!moderationEndpoint) {
-      setAiError('Geen AI-endpoint ingesteld. Voeg VITE_MODERATION_FUNCTION_URL toe aan je omgeving.');
-      return;
+      if (!silent) {
+        setAiError('Geen AI-endpoint ingesteld. Voeg VITE_MODERATION_FUNCTION_URL toe aan je omgeving.');
+      }
+      return null;
     }
 
     setAiLoading(true);
-    setAiError('');
+    if (!silent) {
+      setAiError('');
+    }
     setErrors((prev) => ({ ...prev, moderation: undefined }));
 
     try {
       if (!user) {
-        setAiError('Je moet ingelogd zijn om de AI-check uit te voeren.');
-        return;
+        if (!silent) {
+          setAiError('Je moet ingelogd zijn om de AI-check uit te voeren.');
+        }
+        return null;
       }
       const token = await user.getIdToken();
       const response = await fetch(moderationEndpoint, {
@@ -2166,9 +2174,12 @@ function UploadModal({ onClose, user, profile, users }) {
       setReviewCaseId(nextReviewCaseId);
       setShowSuggestionUI(shouldShowSuggestions);
       setReviewRequested(false);
+      return data;
     } catch (error) {
       console.error('AI check failed', error);
-      setAiError('AI-check mislukt. Probeer het opnieuw.');
+      if (!silent) {
+        setAiError('AI-check mislukt. Probeer het opnieuw.');
+      }
       setAppliedTriggers([]);
       setSuggestedTriggers([]);
       setOutcome(null);
@@ -2176,6 +2187,7 @@ function UploadModal({ onClose, user, profile, users }) {
       setReviewCaseId(null);
       setShowSuggestionUI(false);
       setReviewRequested(false);
+      return null;
     } finally {
       setAiLoading(false);
     }
@@ -2226,7 +2238,22 @@ function UploadModal({ onClose, user, profile, users }) {
       return;
     }
 
-    const baseTriggers = appliedTriggers.length ? appliedTriggers : makerTags;
+    let nextOutcome = outcome;
+    let moderationData = null;
+    if (!nextOutcome || nextOutcome === 'unchecked') {
+      moderationData = await runAICheck({ silent: true });
+      nextOutcome = moderationData?.outcome ?? outcome;
+    }
+
+    if (nextOutcome === 'forbidden') {
+      setErrors((prev) => ({ ...prev, moderation: 'Deze publicatie is geblokkeerd door de safety check.' }));
+      return;
+    }
+
+    const effectiveAppliedTriggers = moderationData?.appliedTriggers ?? appliedTriggers;
+    const effectiveForbiddenReasons = moderationData?.forbiddenReasons ?? forbiddenReasons;
+    const effectiveReviewCaseId = moderationData?.reviewCaseId ?? reviewCaseId;
+    const baseTriggers = effectiveAppliedTriggers.length ? effectiveAppliedTriggers : makerTags;
     const finalAppliedTriggers = applySuggestions
       ? Array.from(new Set([...baseTriggers, ...suggestedTriggers]))
       : baseTriggers;
@@ -2243,9 +2270,9 @@ function UploadModal({ onClose, user, profile, users }) {
          triggers: finalAppliedTriggers.map(getTriggerLabel),
          makerTags,
          appliedTriggers: finalAppliedTriggers,
-         outcome: outcome || 'unchecked',
-         forbiddenReasons,
-         reviewCaseId,
+         outcome: nextOutcome || 'unchecked',
+         forbiddenReasons: effectiveForbiddenReasons,
+         reviewCaseId: effectiveReviewCaseId,
          credits,
          likes: 0
       });
@@ -2303,7 +2330,7 @@ function UploadModal({ onClose, user, profile, users }) {
                               disabled={aiLoading}
                               className="text-xs bg-blue-100 text-blue-700 px-3 py-1 rounded flex items-center gap-1 disabled:opacity-60"
                             >
-                              {aiLoading && <Loader2 className="w-3 h-3 animate-spin" />}AI Scan
+                              {aiLoading && <Loader2 className="w-3 h-3 animate-spin" />}Help me bepalen ✨
                             </button>
                          </div>
                          <p className="text-xs text-slate-500 dark:text-slate-300 mb-2">Selecteer maker-tags om context mee te geven aan de AI-check.</p>
@@ -2353,7 +2380,12 @@ function UploadModal({ onClose, user, profile, users }) {
                            </div>
                          )}
                          {outcome === 'allowed' && !showSuggestionUI && (
-                           <p className="mt-3 text-xs text-emerald-600 dark:text-emerald-300">AI-check: toegestaan. Je kunt direct publiceren.</p>
+                           <div className="mt-3 space-y-1 text-xs text-emerald-600 dark:text-emerald-300">
+                             <p>AI-check: toegestaan. Je kunt direct publiceren.</p>
+                             {appliedTriggers.length === 0 && suggestedTriggers.length === 0 && (
+                               <p>Geen waarschuwingen nodig voor deze foto.</p>
+                             )}
+                           </div>
                          )}
                          {showSuggestionUI && (
                            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-800/40 dark:bg-amber-900/30 dark:text-amber-200">
