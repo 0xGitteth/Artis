@@ -52,6 +52,9 @@ const getFirebaseApp = () => {
 const getFirebaseAuth = () => getAuth(getFirebaseApp());
 const getFirebaseDb = () => getFirestore(getFirebaseApp());
 
+export const getFirebaseAuthInstance = () => getFirebaseAuth();
+export const getFirebaseDbInstance = () => getFirebaseDb();
+
 export const initAuth = async () => {
   const auth = getFirebaseAuth();
   await setPersistence(auth, browserLocalPersistence);

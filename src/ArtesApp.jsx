@@ -29,7 +29,20 @@ import {
   signInWithApple,
   signInWithGoogle,
   updateUserProfile,
+  getFirebaseDbInstance,
 } from './firebase';
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
 
 // --- Constants & Styling ---
 
@@ -124,6 +137,30 @@ const TRIGGER_PREFERENCE_OPTIONS = [
   { id: 'cover', label: 'Cover', desc: 'Cover overlay tonen' },
   { id: 'hideFeed', label: 'Hide feed', desc: 'Post verbergen in de feed' },
 ];
+
+const MODERATION_REASON_PRESETS = [
+  { id: 'explicitSexAct', label: 'Expliciete seksuele handelingen' },
+  { id: 'sexualViolence', label: 'Seksueel geweld of dwang' },
+  { id: 'minorSexualContext', label: 'Minderjarigen in seksuele context of mogelijk minderjarig' },
+  { id: 'activeSelfHarm', label: 'Actieve zelfbeschadiging of suïcide handeling' },
+  { id: 'proAnaBodyCheck', label: 'Schadelijke eetstoornis content pro ana body check' },
+  { id: 'graphicGore', label: 'Grafische gore of schokkend letsel' },
+  { id: 'missingOrIncorrectTags', label: 'Triggers ontbreken of kloppen niet' },
+  { id: 'tooExplicitForPlatform', label: 'Te expliciet voor Artes' },
+];
+
+const buildDecisionTemplate = (decision, reasons) => {
+  if (decision === 'approved') {
+    if (reasons.includes('missingOrIncorrectTags')) {
+      return 'Je foto is gecontroleerd en goedgekeurd. We hebben wel extra trigger tags nodig zodat kijkers kunnen kiezen wat ze zien.';
+    }
+    return 'Je foto is gecontroleerd en goedgekeurd. Bedankt voor het labelen.';
+  }
+  if (reasons.includes('minorSexualContext')) {
+    return 'Je foto kunnen we niet toestaan vanwege veiligheidsbeleid. Als je denkt dat dit een vergissing is, neem dan contact op met Artes Moderatie via de chatfunctie';
+  }
+  return 'Je foto kunnen we niet toestaan omdat hij valt onder verboden inhoud volgens onze regels. Je kunt een andere versie uploaden die niet onder deze categorie valt.';
+};
 
 const buildDefaultAvatar = (seed) =>
   `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(seed || 'artes')}`;
@@ -272,10 +309,23 @@ export default function ArtesApp() {
   const [quickProfileId, setQuickProfileId] = useState(null);
   const [selectedPost, setSelectedPost] = useState(null);
   const [shadowProfileName, setShadowProfileName] = useState(null);
+  const [uploads, setUploads] = useState([]);
+  const [moderationModal, setModerationModal] = useState(null);
+  const [moderationActionPending, setModerationActionPending] = useState(false);
+  const [moderatorAccess, setModeratorAccess] = useState(false);
 
   // Data
   const [posts, setPosts] = useState([]);
   const [users, setUsers] = useState([]);
+  const moderationApiBase = useMemo(() => {
+    const explicitBase = import.meta.env.VITE_MODERATION_API_BASE;
+    if (explicitBase) return explicitBase;
+    const moderationUrl = import.meta.env.VITE_MODERATION_FUNCTION_URL;
+    if (moderationUrl && moderationUrl.includes('/moderateImage')) {
+      return moderationUrl.replace('/moderateImage', '');
+    }
+    return moderationUrl || '';
+  }, []);
 
   // Seeding
   useEffect(() => {
@@ -311,7 +361,14 @@ export default function ArtesApp() {
         const normalized = normalizeProfileData(profileData, u.uid);
         setProfile(normalized);
         const onboardingComplete = profileData?.onboardingComplete === true;
-        setView(onboardingComplete ? 'gallery' : 'onboarding');
+        const baseView = onboardingComplete ? 'gallery' : 'onboarding';
+        const path = window.location.pathname || '/';
+        const routedView = path.startsWith('/moderation')
+          ? 'moderation'
+          : path.startsWith('/messages')
+            ? 'messages'
+            : baseView;
+        setView(routedView);
       } catch (e) {
         console.error('Failed to load profile', e);
         setView('onboarding');
@@ -330,6 +387,31 @@ export default function ArtesApp() {
     setDarkMode(profile.preferences.theme === 'dark');
   }, [profile?.preferences?.theme]);
 
+  useEffect(() => {
+    const handlePopState = () => {
+      const path = window.location.pathname || '/';
+      if (path.startsWith('/moderation')) {
+        setView('moderation');
+      } else if (path.startsWith('/messages')) {
+        setView('messages');
+      } else if (view === 'moderation' || view === 'messages') {
+        setView('gallery');
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [view]);
+
+  useEffect(() => {
+    if (view === 'moderation') {
+      window.history.pushState({}, '', '/moderation');
+    } else if (view === 'messages') {
+      window.history.pushState({}, '', '/messages');
+    } else if (window.location.pathname === '/moderation' || window.location.pathname === '/messages') {
+      window.history.pushState({}, '', '/');
+    }
+  }, [view]);
+
   // Data Listeners
   useEffect(() => {
      if (!user) return;
@@ -337,6 +419,57 @@ export default function ArtesApp() {
      const unsubUsers = subscribeToUsers(setUsers);
      return () => { unsubPosts(); unsubUsers(); };
   }, [user]);
+
+  useEffect(() => {
+    if (!authUser?.uid) return;
+    const db = getFirebaseDbInstance();
+    const q = query(
+      collection(db, 'uploads'),
+      where('userId', '==', authUser.uid),
+      orderBy('createdAt', 'desc'),
+    );
+    return onSnapshot(q, (snapshot) => {
+      setUploads(snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })));
+    });
+  }, [authUser?.uid]);
+
+  useEffect(() => {
+    if (!authUser?.uid) return;
+    const db = getFirebaseDbInstance();
+    const messagesRef = collection(db, 'users', authUser.uid, 'threads', 'moderation', 'messages');
+    const q = query(messagesRef, where('unread', '==', true), orderBy('createdAt', 'desc'), limit(1));
+    return onSnapshot(q, (snapshot) => {
+      if (snapshot.empty) return;
+      const docSnap = snapshot.docs[0];
+      if (moderationModal?.id === docSnap.id) return;
+      setModerationModal({ id: docSnap.id, ...docSnap.data() });
+    });
+  }, [authUser?.uid, moderationModal?.id]);
+
+  useEffect(() => {
+    if (!authUser || !moderationApiBase) {
+      setModeratorAccess(false);
+      return;
+    }
+    let active = true;
+    authUser.getIdToken()
+      .then((token) => fetch(`${moderationApiBase}/isModerator`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+      }))
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!active) return;
+        setModeratorAccess(Boolean(data?.isModerator));
+      })
+      .catch(() => {
+        if (!active) return;
+        setModeratorAccess(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [authUser, moderationApiBase]);
 
   useEffect(() => {
     if (view !== 'profile' || !authUser?.uid) return;
@@ -475,6 +608,34 @@ export default function ArtesApp() {
     setView('login');
   };
 
+  const handleModerationAction = async (action) => {
+    if (!moderationModal || !authUser || !moderationApiBase) return;
+    setModerationActionPending(true);
+    try {
+      const token = await authUser.getIdToken();
+      const response = await fetch(`${moderationApiBase}/userModerationAction`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          messageId: moderationModal.id,
+          uploadId: moderationModal.uploadId,
+          action,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error('Moderatie actie mislukt.');
+      }
+      setModerationModal(null);
+    } catch (error) {
+      console.error('Moderation action failed', error);
+    } finally {
+      setModerationActionPending(false);
+    }
+  };
+
   if (requiresEmailVerification) {
     return (
       <div className={`${darkMode ? 'dark' : ''} h-screen w-full flex flex-col transition-colors duration-300`}>
@@ -539,6 +700,7 @@ export default function ArtesApp() {
              view={view} 
              setView={setView} 
              profile={profile} 
+             moderatorAccess={moderatorAccess}
              toggleTheme={toggleTheme} 
              darkMode={darkMode} 
              onOpenSettings={() => setShowSettingsModal(true)}
@@ -579,6 +741,10 @@ export default function ArtesApp() {
             />
           )}
 
+          {!profileLoading && view === 'moderation' && (
+            <ModerationPanel moderationApiBase={moderationApiBase} authUser={authUser} />
+          )}
+
           {!profileLoading && view === 'discover' && (
             <Discover users={users} posts={posts} onUserClick={setQuickProfileId} onPostClick={setSelectedPost} setView={setView} />
           )}
@@ -592,6 +758,10 @@ export default function ArtesApp() {
             <CommunityDetail id={view.split('_')[1]} setView={setView} />
           )}
 
+          {!profileLoading && view === 'messages' && authUser?.uid && (
+            <MessagesPanel authUser={authUser} />
+          )}
+
           {/* Wrapper logic for viewing profiles */}
           {!profileLoading && view === 'profile' && (
             <ImmersiveProfile 
@@ -601,6 +771,8 @@ export default function ArtesApp() {
               onOpenSettings={() => setShowEditProfile(true)}
               onPostClick={setSelectedPost}
               allUsers={users}
+              uploads={uploads}
+              onOpenMessages={() => setView('messages')}
             />
           )}
           
@@ -628,6 +800,14 @@ export default function ArtesApp() {
         {showSettingsModal && <SettingsModal onClose={() => setShowSettingsModal(false)} profile={profile} onLogout={async() => {await firebaseLogout(); setProfile(null); setAuthUser(null); setView('login');}} darkMode={darkMode} toggleTheme={toggleTheme} />}
         {showEditProfile && <EditProfileModal onClose={() => setShowEditProfile(false)} profile={profile} user={user} />}
         {showTour && <WelcomeTour onClose={handleTourComplete} setView={setView} />}
+        {moderationModal && (
+          <ModerationDecisionModal
+            message={moderationModal}
+            onClose={() => handleModerationAction('dismiss')}
+            onAction={handleModerationAction}
+            pending={moderationActionPending}
+          />
+        )}
         
         {quickProfileId && (
           <UserPreviewModal
@@ -1124,7 +1304,7 @@ function Discover({ users, posts, onUserClick, onPostClick, setView }) {
   );
 }
 
-function NavBar({ view, setView, profile, onOpenSettings }) {
+function NavBar({ view, setView, profile, moderatorAccess, onOpenSettings }) {
    return (
       <>
         <div className="fixed top-0 left-0 right-0 h-16 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 z-30 flex items-center justify-between px-6">
@@ -1132,6 +1312,10 @@ function NavBar({ view, setView, profile, onOpenSettings }) {
            <div className="hidden md:flex gap-6">
               {['gallery', 'discover', 'community'].map(v => <button key={v} onClick={() => setView(v)} className={`capitalize font-medium ${view === v ? 'text-blue-600' : 'text-slate-500'}`}>{v === 'discover' ? 'Ontdekken' : v === 'gallery' ? 'Galerij' : v}</button>)}
               <button onClick={() => setView('profile')} className={`capitalize font-medium ${view === 'profile' ? 'text-blue-600' : 'text-slate-500'}`}>Mijn Portfolio</button>
+              <button onClick={() => setView('messages')} className={`capitalize font-medium ${view === 'messages' ? 'text-blue-600' : 'text-slate-500'}`}>Berichten</button>
+              {moderatorAccess && (
+                <button onClick={() => setView('moderation')} className={`capitalize font-medium ${view === 'moderation' ? 'text-blue-600' : 'text-slate-500'}`}>Moderatie</button>
+              )}
            </div>
            <button onClick={onOpenSettings}><Settings className="w-5 h-5 text-slate-500"/></button>
         </div>
@@ -1139,13 +1323,17 @@ function NavBar({ view, setView, profile, onOpenSettings }) {
            <button onClick={() => setView('gallery')} className={view === 'gallery' ? 'text-blue-600' : 'text-slate-400'}><ImageIcon/></button>
            <button onClick={() => setView('discover')} className={view === 'discover' ? 'text-blue-600' : 'text-slate-400'}><Search/></button>
            <button onClick={() => setView('community')} className={view === 'community' ? 'text-blue-600' : 'text-slate-400'}><Users/></button>
+           <button onClick={() => setView('messages')} className={view === 'messages' ? 'text-blue-600' : 'text-slate-400'}><Bell/></button>
            <button onClick={() => setView('profile')} className={view === 'profile' ? 'text-blue-600' : 'text-slate-400'}><User/></button>
+           {moderatorAccess && (
+             <button onClick={() => setView('moderation')} className={view === 'moderation' ? 'text-blue-600' : 'text-slate-400'}><Shield/></button>
+           )}
         </div>
       </>
    );
 }
 
-function ImmersiveProfile({ profile, isOwn, posts, onOpenSettings, onPostClick }) {
+function ImmersiveProfile({ profile, isOwn, posts, onOpenSettings, onPostClick, uploads = [], onOpenMessages }) {
   if (!profile) return null;
   const normalizedProfile = normalizeProfileData(profile);
   const roles = normalizedProfile.roles;
@@ -1159,6 +1347,11 @@ function ImmersiveProfile({ profile, isOwn, posts, onOpenSettings, onPostClick }
   const hasAgency = Boolean(agencyName);
   const hasCompany = Boolean(companyName);
   const roleLabel = (roleId) => ROLES.find((x) => x.id === roleId)?.label || 'Onbekende rol';
+  const renderReviewStatus = (upload) => {
+    if (upload.reviewStatus === 'approved') return 'Goedgekeurd';
+    if (upload.reviewStatus === 'rejected') return 'Afgekeurd';
+    return 'In review';
+  };
 
   return (
      <div className="min-h-screen bg-white dark:bg-slate-900 pb-20">
@@ -1219,12 +1412,633 @@ function ImmersiveProfile({ profile, isOwn, posts, onOpenSettings, onPostClick }
         </div>
         
         <div className="max-w-6xl mx-auto px-6 py-8 relative z-20">
+           {isOwn && (
+             <div className="mb-10">
+               <div className="flex items-center justify-between mb-4">
+                 <div>
+                   <h2 className="text-xl font-semibold dark:text-white">Upload status</h2>
+                   <p className="text-sm text-slate-500 dark:text-slate-400">Moderatie updates vind je ook in de chat “Artes Moderatie”.</p>
+                 </div>
+                 {onOpenMessages && (
+                   <button
+                     type="button"
+                     onClick={onOpenMessages}
+                     className="text-sm font-semibold text-blue-600 hover:text-blue-700"
+                   >
+                     Open chat
+                   </button>
+                 )}
+               </div>
+               {uploads.length === 0 ? (
+                 <div className="rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 p-6 text-sm text-slate-500 dark:text-slate-400">
+                   Nog geen uploads in moderatie.
+                 </div>
+               ) : (
+                 <div className="space-y-4">
+                   {uploads.map((upload) => (
+                     <div key={upload.id} className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4 space-y-3">
+                       <div className="flex flex-wrap items-center justify-between gap-2">
+                         <div>
+                           <p className="text-sm font-semibold dark:text-white">Upload {upload.id.slice(0, 6)}</p>
+                           <p className="text-xs text-slate-500">{renderReviewStatus(upload)}</p>
+                         </div>
+                         <span className={`text-xs font-semibold px-3 py-1 rounded-full ${
+                           upload.reviewStatus === 'approved'
+                             ? 'bg-emerald-100 text-emerald-700'
+                             : upload.reviewStatus === 'rejected'
+                               ? 'bg-red-100 text-red-700'
+                               : 'bg-slate-100 text-slate-600'
+                         }`}>
+                           {renderReviewStatus(upload)}
+                         </span>
+                       </div>
+                       {upload.reviewDecisionMessagePublic && (
+                         <p className="text-sm text-slate-700 dark:text-slate-200">{upload.reviewDecisionMessagePublic}</p>
+                       )}
+                       {Array.isArray(upload.reviewDecisionReasons) && upload.reviewDecisionReasons.length > 0 && (
+                         <div className="flex flex-wrap gap-2">
+                           {upload.reviewDecisionReasons.map((reason) => {
+                             const label = MODERATION_REASON_PRESETS.find((preset) => preset.id === reason)?.label || reason;
+                             return (
+                               <span key={reason} className="text-[11px] px-2 py-1 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-200">
+                                 {label}
+                               </span>
+                             );
+                           })}
+                         </div>
+                       )}
+                     </div>
+                   ))}
+                 </div>
+               )}
+             </div>
+           )}
            <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
               {posts.map(p => <div key={p.id} onClick={() => onPostClick(p)} className="aspect-[4/5] bg-slate-200 rounded-sm overflow-hidden cursor-pointer"><img src={p.imageUrl} className="w-full h-full object-cover"/></div>)}
            </div>
            {posts.length === 0 && <p className="text-center text-slate-500 py-10">Nog geen posts.</p>}
         </div>
      </div>
+  );
+}
+
+function ModerationDecisionModal({ message, onClose, onAction, pending }) {
+  if (!message) return null;
+  const isApproved = message.decision === 'approved';
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
+      <div className="bg-white dark:bg-slate-900 w-full max-w-lg rounded-3xl overflow-hidden shadow-xl">
+        <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex justify-between items-center">
+          <h3 className="font-bold text-lg dark:text-white">{message.title}</h3>
+          <button onClick={onClose} disabled={pending}><X /></button>
+        </div>
+        <div className="p-6 space-y-4">
+          <p className="text-sm text-slate-700 dark:text-slate-200">{message.message}</p>
+          {Array.isArray(message.reasons) && message.reasons.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {message.reasons.map((reason) => {
+                const label = MODERATION_REASON_PRESETS.find((preset) => preset.id === reason)?.label || reason;
+                return (
+                  <span key={reason} className="text-[11px] px-2 py-1 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-200">
+                    {label}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Je kunt dit bericht terugvinden in de chat Artes Moderatie.
+          </p>
+        </div>
+        <div className="p-6 border-t border-slate-200 dark:border-slate-700 flex flex-wrap gap-3 justify-end">
+          {isApproved ? (
+            <>
+              <Button variant="secondary" onClick={() => onAction('saveDraft')} disabled={pending}>
+                Later plaatsen
+              </Button>
+              <Button onClick={() => onAction('publishNow')} disabled={pending}>
+                Nu plaatsen
+              </Button>
+            </>
+          ) : (
+            <Button onClick={() => onAction('dismiss')} disabled={pending}>
+              Oké
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MessagesPanel({ authUser }) {
+  const [messages, setMessages] = useState([]);
+
+  useEffect(() => {
+    if (!authUser?.uid) return;
+    const db = getFirebaseDbInstance();
+    const messagesRef = collection(db, 'users', authUser.uid, 'threads', 'moderation', 'messages');
+    const q = query(messagesRef, orderBy('createdAt', 'desc'));
+    return onSnapshot(q, (snapshot) => {
+      setMessages(snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })));
+    });
+  }, [authUser?.uid]);
+
+  useEffect(() => {
+    if (!authUser?.uid || messages.length === 0) return;
+    const db = getFirebaseDbInstance();
+    const updates = messages.filter((message) => message.unread);
+    if (updates.length === 0) return;
+    updates.forEach((message) => {
+      const messageRef = doc(db, 'users', authUser.uid, 'threads', 'moderation', 'messages', message.id);
+      updateDoc(messageRef, { unread: false }).catch(() => {});
+    });
+  }, [authUser?.uid, messages]);
+
+  return (
+    <div className="max-w-3xl mx-auto px-6 py-8 space-y-6">
+      <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-700 p-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-xl font-semibold dark:text-white">Artes Moderatie</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">Vastgezet gesprek met moderatie-updates.</p>
+          </div>
+          <span className="text-xs font-semibold px-2 py-1 rounded-full bg-blue-100 text-blue-700">Vastgezet</span>
+        </div>
+      </div>
+      <div className="space-y-4">
+        {messages.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 p-6 text-sm text-slate-500 dark:text-slate-400">
+            Nog geen moderatieberichten.
+          </div>
+        ) : (
+          messages.map((message) => (
+            <div key={message.id} className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="font-semibold dark:text-white">{message.title}</p>
+                <span className={`text-xs px-2 py-1 rounded-full ${
+                  message.decision === 'approved'
+                    ? 'bg-emerald-100 text-emerald-700'
+                    : 'bg-red-100 text-red-700'
+                }`}>
+                  {message.decision === 'approved' ? 'Goedgekeurd' : 'Afgekeurd'}
+                </span>
+              </div>
+              <p className="text-sm text-slate-700 dark:text-slate-200">{message.message}</p>
+              {Array.isArray(message.reasons) && message.reasons.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {message.reasons.map((reason) => {
+                    const label = MODERATION_REASON_PRESETS.find((preset) => preset.id === reason)?.label || reason;
+                    return (
+                      <span key={reason} className="text-[11px] px-2 py-1 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-200">
+                        {label}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+              {message.actions && (
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  Acties beschikbaar: {message.actions.canPublishNow ? 'Nu plaatsen' : 'Geen'} · {message.actions.canSaveDraft ? 'Later plaatsen' : 'Geen'}
+                </div>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ModerationPanel({ moderationApiBase, authUser }) {
+  const [isModerator, setIsModerator] = useState(null);
+  const [cases, setCases] = useState([]);
+  const [selectedCaseId, setSelectedCaseId] = useState(null);
+  const [selectedCase, setSelectedCase] = useState(null);
+  const [selectedUpload, setSelectedUpload] = useState(null);
+  const [claimState, setClaimState] = useState({ claimed: false, claimedBy: null, loading: false });
+  const [decision, setDecision] = useState('approved');
+  const [selectedReasons, setSelectedReasons] = useState([]);
+  const [decisionMessage, setDecisionMessage] = useState('');
+  const [messageTouched, setMessageTouched] = useState(false);
+  const [moderatorNote, setModeratorNote] = useState('');
+  const [decisionPending, setDecisionPending] = useState(false);
+  const [decisionError, setDecisionError] = useState(null);
+
+  useEffect(() => {
+    if (!authUser || !moderationApiBase) return;
+    let active = true;
+    authUser.getIdToken()
+      .then((token) => fetch(`${moderationApiBase}/isModerator`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+      }))
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!active) return;
+        setIsModerator(Boolean(data?.isModerator));
+      })
+      .catch(() => {
+        if (!active) return;
+        setIsModerator(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [authUser, moderationApiBase]);
+
+  useEffect(() => {
+    if (!isModerator) return;
+    const db = getFirebaseDbInstance();
+    const q = query(collection(db, 'reviewCases'), where('status', '==', 'inReview'), orderBy('createdAt', 'desc'));
+    return onSnapshot(q, (snapshot) => {
+      setCases(snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })));
+    });
+  }, [isModerator]);
+
+  useEffect(() => {
+    if (!selectedCaseId) {
+      setSelectedCase(null);
+      setSelectedUpload(null);
+      return;
+    }
+    const found = cases.find((item) => item.id === selectedCaseId) || null;
+    setSelectedCase(found);
+  }, [selectedCaseId, cases]);
+
+  useEffect(() => {
+    if (!selectedCase) {
+      setSelectedUpload(null);
+      return;
+    }
+    const uploadId = selectedCase.uploadId || selectedCase.linkedUploadIds?.[0];
+    if (!uploadId) {
+      setSelectedUpload(null);
+      return;
+    }
+    const db = getFirebaseDbInstance();
+    getDoc(doc(db, 'uploads', uploadId))
+      .then((snapshot) => {
+        if (!snapshot.exists()) {
+          setSelectedUpload(null);
+        } else {
+          setSelectedUpload({ id: snapshot.id, ...snapshot.data() });
+        }
+      })
+      .catch(() => setSelectedUpload(null));
+  }, [selectedCase]);
+
+  useEffect(() => {
+    if (!selectedCaseId || !authUser || !moderationApiBase) return;
+    let active = true;
+    const claim = async () => {
+      setClaimState((prev) => ({ ...prev, loading: true }));
+      try {
+        const token = await authUser.getIdToken();
+        const response = await fetch(`${moderationApiBase}/moderatorClaim`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ reviewCaseId: selectedCaseId }),
+        });
+        const data = await response.json();
+        if (!active) return;
+        setClaimState({
+          claimed: Boolean(data?.claimed),
+          claimedBy: data?.claimedBy || null,
+          loading: false,
+        });
+      } catch (error) {
+        if (!active) return;
+        setClaimState({ claimed: false, claimedBy: null, loading: false });
+      }
+    };
+    claim();
+    return () => {
+      active = false;
+    };
+  }, [selectedCaseId, authUser, moderationApiBase]);
+
+  useEffect(() => {
+    if (!selectedCaseId || !claimState.claimed || !authUser || !moderationApiBase) return;
+    const interval = setInterval(async () => {
+      try {
+        const token = await authUser.getIdToken();
+        await fetch(`${moderationApiBase}/moderatorClaim`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ reviewCaseId: selectedCaseId }),
+        });
+      } catch (error) {
+        console.error('Failed to refresh lock', error);
+      }
+    }, 3 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [selectedCaseId, claimState.claimed, authUser, moderationApiBase]);
+
+  useEffect(() => {
+    return () => {
+      if (!selectedCaseId || !authUser || !moderationApiBase) return;
+      authUser.getIdToken()
+        .then((token) => fetch(`${moderationApiBase}/moderatorRelease`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ reviewCaseId: selectedCaseId }),
+        }))
+        .catch(() => {});
+    };
+  }, [selectedCaseId, authUser, moderationApiBase]);
+
+  useEffect(() => {
+    if (messageTouched) return;
+    setDecisionMessage(buildDecisionTemplate(decision, selectedReasons));
+  }, [decision, selectedReasons, messageTouched]);
+
+  useEffect(() => {
+    if (!selectedCase) return;
+    setDecision('approved');
+    setSelectedReasons([]);
+    setDecisionMessage(buildDecisionTemplate('approved', []));
+    setMessageTouched(false);
+    setModeratorNote('');
+    setDecisionError(null);
+  }, [selectedCase?.id]);
+
+  useEffect(() => {
+    const handler = (event) => {
+      if (isModerator !== true) return;
+      const activeElement = document.activeElement;
+      if (activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName)) {
+        return;
+      }
+      if (event.key.toLowerCase() === 'a') {
+        setDecision('approved');
+        setMessageTouched(false);
+      }
+      if (event.key.toLowerCase() === 'r') {
+        setDecision('rejected');
+        setMessageTouched(false);
+      }
+      if (event.key.toLowerCase() === 'j') {
+        const index = cases.findIndex((item) => item.id === selectedCaseId);
+        if (index < cases.length - 1) {
+          setSelectedCaseId(cases[index + 1].id);
+        }
+      }
+      if (event.key.toLowerCase() === 'k') {
+        const index = cases.findIndex((item) => item.id === selectedCaseId);
+        if (index > 0) {
+          setSelectedCaseId(cases[index - 1].id);
+        }
+      }
+      if (event.key.toLowerCase() === 'n') {
+        const noteField = document.getElementById('moderator-note');
+        noteField?.focus();
+      }
+      if (event.key === 'Escape') {
+        setSelectedCaseId(null);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [cases, selectedCaseId, isModerator]);
+
+  const toggleReason = (reasonId) => {
+    setMessageTouched(false);
+    setSelectedReasons((prev) => {
+      if (prev.includes(reasonId)) {
+        return prev.filter((item) => item !== reasonId);
+      }
+      if (prev.length >= 3) return prev;
+      return [...prev, reasonId];
+    });
+  };
+
+  const handleDecisionSubmit = async () => {
+    if (!selectedCase || !authUser || !moderationApiBase) return;
+    if (!decisionMessage.trim()) {
+      setDecisionError('Voeg een moderatiebericht toe.');
+      return;
+    }
+    if (decisionMessage.length > 280) {
+      setDecisionError('Het bericht mag maximaal 280 tekens zijn.');
+      return;
+    }
+    if (decision === 'rejected' && selectedReasons.length === 1 && selectedReasons[0] === 'missingOrIncorrectTags') {
+      setDecisionError('Triggers ontbreken of kloppen niet kan niet alleen tot afkeuring leiden.');
+      return;
+    }
+    setDecisionPending(true);
+    setDecisionError(null);
+    try {
+      const token = await authUser.getIdToken();
+      const response = await fetch(`${moderationApiBase}/moderatorDecide`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          reviewCaseId: selectedCase.id,
+          decision,
+          decisionMessagePublic: decisionMessage.trim(),
+          decisionReasons: selectedReasons,
+          moderatorNoteInternal: moderatorNote || null,
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json();
+        throw new Error(payload?.error || 'Beslissing opslaan mislukt.');
+      }
+      setSelectedCaseId(null);
+    } catch (error) {
+      setDecisionError(error.message);
+    } finally {
+      setDecisionPending(false);
+    }
+  };
+
+  if (isModerator === false) {
+    return (
+      <div className="max-w-2xl mx-auto px-6 py-10 text-center">
+        <div className="bg-white dark:bg-slate-900 rounded-3xl border border-slate-200 dark:border-slate-700 p-10">
+          <Shield className="w-10 h-10 text-slate-400 mx-auto mb-4" />
+          <h2 className="text-xl font-semibold dark:text-white">Geen toegang</h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400">Je hebt geen toegang tot moderatie.</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (isModerator === null) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <Loader2 className="w-6 h-6 animate-spin" />
+      </div>
+    );
+  }
+
+  const isLockedByOther = selectedCaseId && !claimState.claimed;
+  const uploadPreviewUrl = selectedUpload?.previewUrl || selectedUpload?.imageUrl || selectedUpload?.image || null;
+  const tags = selectedUpload?.appliedTriggers || selectedUpload?.makerTags || [];
+
+  return (
+    <div className="max-w-6xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-6">
+      <div className="space-y-4">
+        <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-700 p-4 flex items-center justify-between">
+          <div>
+            <h2 className="font-semibold dark:text-white">Moderatie queue</h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">{cases.length} in review</p>
+          </div>
+          <div className="text-xs text-slate-400">J/K</div>
+        </div>
+        <div className="space-y-3 max-h-[70vh] overflow-y-auto no-scrollbar">
+          {cases.map((item) => (
+            <button
+              key={item.id}
+              onClick={() => setSelectedCaseId(item.id)}
+              className={`w-full text-left rounded-2xl border p-4 transition ${
+                item.id === selectedCaseId
+                  ? 'border-blue-400 bg-blue-50 dark:bg-blue-900/20'
+                  : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900'
+              }`}
+            >
+              <p className="text-sm font-semibold dark:text-white">Case {item.id.slice(0, 6)}</p>
+              <p className="text-xs text-slate-500">Uploader: {item.userId || 'Onbekend'}</p>
+            </button>
+          ))}
+          {cases.length === 0 && (
+            <div className="text-xs text-slate-500 dark:text-slate-400">Geen open cases.</div>
+          )}
+        </div>
+      </div>
+
+      <div className="space-y-6">
+        {!selectedCase && (
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 p-10 text-center text-sm text-slate-500 dark:text-slate-400">
+            Selecteer een case om details te bekijken.
+          </div>
+        )}
+
+        {selectedCase && (
+          <>
+            {isLockedByOther && (
+              <div className="rounded-2xl border border-amber-200 bg-amber-50 dark:border-amber-800/40 dark:bg-amber-900/30 p-4 text-sm text-amber-800 dark:text-amber-200">
+                Al in behandeling door {claimState.claimedBy || 'een andere moderator'}.
+              </div>
+            )}
+
+            <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-700 p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold dark:text-white">Case {selectedCase.id}</h2>
+                <div className="text-xs text-slate-400">A/R · N · Esc</div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-6">
+                <div className="space-y-3">
+                  <div className="aspect-[4/5] rounded-2xl bg-slate-100 dark:bg-slate-800 overflow-hidden flex items-center justify-center">
+                    {uploadPreviewUrl ? (
+                      <img src={uploadPreviewUrl} className="w-full h-full object-cover" />
+                    ) : (
+                      <span className="text-xs text-slate-400">Geen preview</span>
+                    )}
+                  </div>
+                  <div>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">Uploader tags</p>
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      {tags.length > 0 ? tags.map((tag) => (
+                        <span key={tag} className="text-[11px] px-2 py-1 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-200">
+                          {tag}
+                        </span>
+                      )) : (
+                        <span className="text-xs text-slate-400">Geen tags</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-4">
+                  <div>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">AI snapshot</p>
+                    <pre className="text-xs bg-slate-50 dark:bg-slate-800 rounded-xl p-3 max-h-40 overflow-y-auto no-scrollbar text-slate-600 dark:text-slate-200">
+                      {JSON.stringify(selectedCase.aiSnapshot || {}, null, 2)}
+                    </pre>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex gap-3">
+                      <Button variant={decision === 'approved' ? 'primary' : 'secondary'} onClick={() => { setDecision('approved'); setMessageTouched(false); }}>
+                        Goedkeuren (A)
+                      </Button>
+                      <Button variant={decision === 'rejected' ? 'danger' : 'secondary'} onClick={() => { setDecision('rejected'); setMessageTouched(false); }}>
+                        Afkeuren (R)
+                      </Button>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-slate-500 dark:text-slate-300">Redenen (max 3)</label>
+                      <div className="flex flex-wrap gap-2 mt-2">
+                        {MODERATION_REASON_PRESETS.map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            onClick={() => toggleReason(preset.id)}
+                            className={`text-[11px] px-3 py-1 rounded-full border transition ${
+                              selectedReasons.includes(preset.id)
+                                ? 'bg-blue-600 text-white border-blue-600'
+                                : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-200 border-slate-200 dark:border-slate-700'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-slate-500 dark:text-slate-300">Bericht aan uploader</label>
+                      <textarea
+                        className="mt-2 w-full p-3 rounded-xl border dark:bg-slate-800 dark:text-white"
+                        value={decisionMessage}
+                        onChange={(event) => {
+                          setDecisionMessage(event.target.value);
+                          setMessageTouched(true);
+                        }}
+                        maxLength={280}
+                        rows={4}
+                      />
+                      <div className="text-xs text-slate-400 mt-1">{decisionMessage.length}/280</div>
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-slate-500 dark:text-slate-300">Interne notitie (alleen moderators)</label>
+                      <textarea
+                        id="moderator-note"
+                        className="mt-2 w-full p-3 rounded-xl border dark:bg-slate-800 dark:text-white"
+                        value={moderatorNote}
+                        onChange={(event) => setModeratorNote(event.target.value)}
+                        rows={3}
+                      />
+                    </div>
+                    {decisionError && <p className="text-xs text-red-500">{decisionError}</p>}
+                    <Button
+                      onClick={handleDecisionSubmit}
+                      disabled={decisionPending || isLockedByOther}
+                      className="w-full"
+                    >
+                      {decisionPending ? 'Beslissing opslaan...' : 'Beslissing opslaan'}
+                    </Button>
+                    <p className="text-[11px] text-slate-400">Shortcuts: A/R, J/K, N (notitie), Esc</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 

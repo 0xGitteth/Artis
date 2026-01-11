@@ -5,7 +5,7 @@ import { VertexAI } from '@google-cloud/vertexai';
 import { onRequest } from 'firebase-functions/v2/https';
 import { logger } from 'firebase-functions';
 import admin from 'firebase-admin';
-import { FieldValue, getFirestore } from 'firebase-admin/firestore';
+import { FieldValue, Timestamp, getFirestore } from 'firebase-admin/firestore';
 
 const suggestThreshold = 0.45;
 const forbiddenThreshold = 0.7;
@@ -34,6 +34,96 @@ if (!admin.apps.length) {
 }
 
 const db = getFirestore();
+const lockDurationMs = 10 * 60 * 1000;
+
+const getTokenFromRequest = (req) => {
+  const header = req.get('Authorization') || '';
+  if (!header.startsWith('Bearer ')) return null;
+  return header.slice(7);
+};
+
+const verifyToken = async (req) => {
+  const token = getTokenFromRequest(req);
+  if (!token) {
+    const error = new Error('Missing auth token');
+    error.status = 401;
+    throw error;
+  }
+  try {
+    return await admin.auth().verifyIdToken(token);
+  } catch (error) {
+    const err = new Error('Invalid auth token');
+    err.status = 401;
+    throw err;
+  }
+};
+
+const requireEmailVerified = (decoded) => {
+  if (!decoded?.email_verified) {
+    const error = new Error('Email not verified');
+    error.status = 403;
+    throw error;
+  }
+};
+
+const requireVerifiedPasswordUser = (decoded) => {
+  const provider = decoded?.firebase?.sign_in_provider;
+  if (provider === 'password' && !decoded?.email_verified) {
+    const error = new Error('Email not verified');
+    error.status = 403;
+    throw error;
+  }
+};
+
+const getModeratorConfig = async () => {
+  const snapshot = await db.collection('config').doc('moderation').get();
+  const data = snapshot.exists ? snapshot.data() : {};
+  const moderatorEmails = Array.isArray(data?.moderatorEmails)
+    ? data.moderatorEmails.map((email) => String(email).toLowerCase())
+    : [];
+  return { moderatorEmails };
+};
+
+const ensureModerator = async (decoded) => {
+  requireEmailVerified(decoded);
+  const { moderatorEmails } = await getModeratorConfig();
+  const email = decoded?.email?.toLowerCase() || '';
+  if (!email || !moderatorEmails.includes(email)) {
+    const error = new Error('Not a moderator');
+    error.status = 403;
+    throw error;
+  }
+  return { email };
+};
+
+const parseJsonBody = (req) => {
+  if (req.body && typeof req.body === 'object') return req.body;
+  if (typeof req.body === 'string') {
+    try {
+      return JSON.parse(req.body);
+    } catch (error) {
+      return null;
+    }
+  }
+  return null;
+};
+
+const createDecisionMessage = ({ decision, decisionMessagePublic, decisionReasons = [] }) => {
+  const isApproved = decision === 'approved';
+  return {
+    type: 'moderation_decision',
+    decision,
+    title: isApproved ? 'Je foto is goedgekeurd' : 'Je foto is niet goedgekeurd',
+    message: decisionMessagePublic,
+    reasons: decisionReasons,
+    unread: true,
+    resolved: false,
+    actions: {
+      canPublishNow: isApproved,
+      canSaveDraft: isApproved,
+    },
+  };
+};
 
 const normalizeMakerTags = (makerTags) => {
   const raw = Array.isArray(makerTags)
@@ -559,6 +649,363 @@ export const moderateImage = onRequest({ cors: true }, async (req, res) => {
   }
 
   res.status(200).json(response);
+});
+
+export const isModerator = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  try {
+    const decoded = await verifyToken(req);
+    const { moderatorEmails } = await getModeratorConfig();
+    const email = decoded?.email?.toLowerCase() || '';
+    const isAllowed = Boolean(email && decoded?.email_verified && moderatorEmails.includes(email));
+    res.status(200).json({ isModerator: isAllowed });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error.message || 'Failed to verify moderator' });
+  }
+});
+
+export const moderatorClaim = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  try {
+    const decoded = await verifyToken(req);
+    const { email } = await ensureModerator(decoded);
+    const body = parseJsonBody(req);
+    const reviewCaseId = body?.reviewCaseId;
+    if (!reviewCaseId) {
+      res.status(400).json({ error: 'reviewCaseId is required' });
+      return;
+    }
+    const now = Date.now();
+    const reviewRef = db.collection('reviewCases').doc(reviewCaseId);
+    let claimed = false;
+    let claimedBy = null;
+
+    await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(reviewRef);
+      if (!snapshot.exists) {
+        const error = new Error('Review case not found');
+        error.status = 404;
+        throw error;
+      }
+      const data = snapshot.data();
+      if (data?.status !== 'inReview') {
+        const error = new Error('Review case is not in review');
+        error.status = 409;
+        throw error;
+      }
+      const lock = data?.lock;
+      const expiresAt = lock?.expiresAt?.toDate ? lock.expiresAt.toDate() : lock?.expiresAt;
+      const isLocked = expiresAt && expiresAt.getTime ? expiresAt.getTime() > now : false;
+      if (isLocked && lock?.claimedByUid !== decoded.uid) {
+        claimed = false;
+        claimedBy = lock?.claimedByEmail || null;
+        return;
+      }
+      const expires = Timestamp.fromDate(new Date(now + lockDurationMs));
+      transaction.update(reviewRef, {
+        lock: {
+          claimedByUid: decoded.uid,
+          claimedByEmail: email,
+          claimedAt: FieldValue.serverTimestamp(),
+          expiresAt: expires,
+        },
+      });
+      claimed = true;
+      claimedBy = email;
+    });
+
+    res.status(200).json({ ok: true, claimed, claimedBy });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error.message || 'Failed to claim review case' });
+  }
+});
+
+export const moderatorRelease = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  try {
+    const decoded = await verifyToken(req);
+    await ensureModerator(decoded);
+    const body = parseJsonBody(req);
+    const reviewCaseId = body?.reviewCaseId;
+    if (!reviewCaseId) {
+      res.status(400).json({ error: 'reviewCaseId is required' });
+      return;
+    }
+    const reviewRef = db.collection('reviewCases').doc(reviewCaseId);
+    await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(reviewRef);
+      if (!snapshot.exists) return;
+      const data = snapshot.data();
+      if (data?.lock?.claimedByUid === decoded.uid) {
+        transaction.update(reviewRef, { lock: FieldValue.delete() });
+      }
+    });
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error.message || 'Failed to release lock' });
+  }
+});
+
+export const moderatorDecide = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  try {
+    const decoded = await verifyToken(req);
+    const { email } = await ensureModerator(decoded);
+    const body = parseJsonBody(req);
+    const {
+      reviewCaseId,
+      decision,
+      decisionMessagePublic,
+      decisionReasons = [],
+      moderatorNoteInternal = null,
+    } = body || {};
+
+    if (!reviewCaseId) {
+      res.status(400).json({ error: 'reviewCaseId is required' });
+      return;
+    }
+    if (!['approved', 'rejected'].includes(decision)) {
+      res.status(400).json({ error: 'Invalid decision' });
+      return;
+    }
+    const trimmedMessage = String(decisionMessagePublic || '').trim();
+    if (!trimmedMessage) {
+      res.status(400).json({ error: 'decisionMessagePublic is required' });
+      return;
+    }
+    if (trimmedMessage.length > 280) {
+      res.status(400).json({ error: 'decisionMessagePublic must be <= 280 chars' });
+      return;
+    }
+    if (!Array.isArray(decisionReasons) || decisionReasons.length > 3) {
+      res.status(400).json({ error: 'decisionReasons must be max 3 items' });
+      return;
+    }
+
+    const now = Date.now();
+    const reviewRef = db.collection('reviewCases').doc(reviewCaseId);
+    let uploadId = null;
+    let userId = null;
+    let reviewSnapshotData = null;
+
+    await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(reviewRef);
+      if (!snapshot.exists) {
+        const error = new Error('Review case not found');
+        error.status = 404;
+        throw error;
+      }
+      const data = snapshot.data();
+      reviewSnapshotData = data;
+      if (data?.status !== 'inReview') {
+        const error = new Error('Review case already decided');
+        error.status = 409;
+        throw error;
+      }
+      const lock = data?.lock;
+      const expiresAt = lock?.expiresAt?.toDate ? lock.expiresAt.toDate() : lock?.expiresAt;
+      const isLocked = expiresAt && expiresAt.getTime ? expiresAt.getTime() > now : false;
+      if (isLocked && lock?.claimedByUid && lock?.claimedByUid !== decoded.uid) {
+        const error = new Error('Review case locked by another moderator');
+        error.status = 423;
+        throw error;
+      }
+      const expires = Timestamp.fromDate(new Date(now + lockDurationMs));
+      transaction.update(reviewRef, {
+        lock: {
+          claimedByUid: decoded.uid,
+          claimedByEmail: email,
+          claimedAt: FieldValue.serverTimestamp(),
+          expiresAt: expires,
+        },
+      });
+
+      uploadId = data?.uploadId || (Array.isArray(data?.linkedUploadIds) ? data.linkedUploadIds[0] : null);
+      userId = data?.userId || null;
+      if (!uploadId || !userId) {
+        const error = new Error('Review case missing uploadId or userId');
+        error.status = 400;
+        throw error;
+      }
+
+      const uploadRef = db.collection('uploads').doc(uploadId);
+      const isApproved = decision === 'approved';
+      transaction.update(uploadRef, {
+        reviewStatus: decision,
+        reviewDecisionMessagePublic: trimmedMessage,
+        reviewDecisionReasons: decisionReasons,
+        reviewDecisionAt: FieldValue.serverTimestamp(),
+        publicationStatus: isApproved ? 'pending' : 'blocked',
+        approvedAt: isApproved ? FieldValue.serverTimestamp() : FieldValue.delete(),
+        reviewCaseId,
+      });
+
+      transaction.update(reviewRef, {
+        status: decision,
+        decisionMessagePublic: trimmedMessage,
+        decisionReasons,
+        moderatorNoteInternal: moderatorNoteInternal || null,
+        decidedAt: FieldValue.serverTimestamp(),
+        decidedByUid: decoded.uid,
+        decidedByEmail: email,
+        uploadId,
+        lock: FieldValue.delete(),
+      });
+    });
+
+    if (!uploadId || !userId) {
+      res.status(500).json({ error: 'Failed to update decision' });
+      return;
+    }
+
+    const threadRef = db.collection('users').doc(userId).collection('threads').doc('moderation');
+    const messageRef = threadRef.collection('messages').doc();
+    const decisionMessage = createDecisionMessage({
+      decision,
+      decisionMessagePublic: trimmedMessage,
+      decisionReasons,
+    });
+    await Promise.all([
+      threadRef.set(
+        {
+          title: 'Artes Moderatie',
+          pinned: true,
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+          lastMessageAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      ),
+      messageRef.set({
+        ...decisionMessage,
+        uploadId,
+        reviewCaseId,
+        createdAt: FieldValue.serverTimestamp(),
+      }),
+    ]);
+
+    res.status(200).json({ ok: true, reviewCaseId, uploadId, userId, reviewCase: reviewSnapshotData });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error.message || 'Failed to decide review case' });
+  }
+});
+
+export const userModerationAction = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  try {
+    const decoded = await verifyToken(req);
+    requireVerifiedPasswordUser(decoded);
+    const body = parseJsonBody(req);
+    const { messageId, uploadId, action } = body || {};
+    if (!messageId || !uploadId || !action) {
+      res.status(400).json({ error: 'messageId, uploadId and action are required' });
+      return;
+    }
+    if (!['publishNow', 'saveDraft', 'dismiss'].includes(action)) {
+      res.status(400).json({ error: 'Invalid action' });
+      return;
+    }
+    const userId = decoded.uid;
+    const threadRef = db.collection('users').doc(userId).collection('threads').doc('moderation');
+    const messageRef = threadRef.collection('messages').doc(messageId);
+    const uploadRef = db.collection('uploads').doc(uploadId);
+
+    const [messageSnap, uploadSnap] = await Promise.all([messageRef.get(), uploadRef.get()]);
+    if (!messageSnap.exists || !uploadSnap.exists) {
+      res.status(404).json({ error: 'Message or upload not found' });
+      return;
+    }
+    const message = messageSnap.data();
+    const upload = uploadSnap.data();
+    if (message?.uploadId !== uploadId || upload?.userId !== userId) {
+      res.status(403).json({ error: 'Not authorized for this action' });
+      return;
+    }
+
+    if (action === 'publishNow' && upload?.reviewStatus !== 'approved') {
+      res.status(409).json({ error: 'Upload is not approved' });
+      return;
+    }
+    if (action === 'saveDraft' && upload?.reviewStatus !== 'approved') {
+      res.status(409).json({ error: 'Upload is not approved' });
+      return;
+    }
+
+    if (action === 'publishNow') {
+      await Promise.all([
+        uploadRef.set(
+          {
+            publicationStatus: 'published',
+            publishedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        ),
+        messageRef.set(
+          {
+            unread: false,
+            resolved: true,
+            resolvedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        ),
+      ]);
+    }
+
+    if (action === 'saveDraft') {
+      const draftRef = db.collection('users').doc(userId).collection('drafts').doc();
+      await Promise.all([
+        draftRef.set({
+          uploadId,
+          storagePath: upload?.storagePath || null,
+          imageRef: upload?.imageRef || null,
+          caption: upload?.caption || null,
+          tags: upload?.tags || null,
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+          status: 'draft',
+        }),
+        uploadRef.set({ publicationStatus: 'draft' }, { merge: true }),
+        messageRef.set(
+          {
+            unread: false,
+            resolved: true,
+            resolvedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        ),
+      ]);
+    }
+
+    if (action === 'dismiss') {
+      await messageRef.set({ unread: false }, { merge: true });
+    }
+
+    await threadRef.set({ updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error.message || 'Failed to perform action' });
+  }
 });
 
 export const config = {
