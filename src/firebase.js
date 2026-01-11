@@ -22,7 +22,6 @@ import {
   doc,
   setDoc,
   getDoc,
-  updateDoc,
   collection,
   addDoc,
   onSnapshot,
@@ -104,7 +103,11 @@ export const createUserProfile = async (uid, profile) => {
 };
 
 export const updateUserProfile = async (uid, data) => {
-  await updateDoc(doc(getFirebaseDb(), 'users', uid), { ...data, updatedAt: serverTimestamp() });
+  await setDoc(
+    doc(getFirebaseDb(), 'users', uid),
+    { ...data, updatedAt: serverTimestamp() },
+    { merge: true },
+  );
 };
 
 export const fetchUserProfile = (uid) => getDoc(doc(getFirebaseDb(), 'users', uid));

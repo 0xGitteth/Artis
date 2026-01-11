@@ -452,7 +452,13 @@ export default function ArtesApp() {
       setUser(refreshed);
       if (!refreshed?.emailVerified) {
         setVerificationNote('Je email is nog niet geverifieerd.');
+        return;
       }
+      const profileData = await ensureUserProfile(refreshed);
+      const normalized = normalizeProfileData(profileData, refreshed?.uid);
+      setProfile(normalized);
+      const onboardingComplete = profileData?.onboardingComplete === true;
+      setView(onboardingComplete ? 'gallery' : 'onboarding');
     } catch (error) {
       console.error('Failed to refresh verification state', error);
       setVerificationNote('Er ging iets mis, probeer het opnieuw.');
