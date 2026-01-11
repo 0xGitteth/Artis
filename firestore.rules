@@ -4,11 +4,51 @@ service cloud.firestore {
     function isVerifiedUser() {
       return request.auth != null && request.auth.token.email_verified == true;
     }
+    function isModerator() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && get(/databases/$(database)/documents/config/moderation).data.moderatorEmails != null
+        && request.auth.token.email in get(/databases/$(database)/documents/config/moderation).data.moderatorEmails;
+    }
+
+    match /config/moderation {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
 
     match /users/{userId} {
       allow read: if request.auth != null && request.auth.uid == userId;
       allow create: if request.auth != null && request.auth.uid == userId;
       allow update, delete: if isVerifiedUser() && request.auth.uid == userId;
+
+      match /threads/{threadId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow create, delete: if false;
+        allow update: if false;
+
+        match /messages/{messageId} {
+          allow read: if request.auth != null && request.auth.uid == userId;
+          allow create, delete: if false;
+          allow update: if request.auth != null
+            && request.auth.uid == userId
+            && request.resource.data.diff(resource.data).changedKeys().hasOnly(['unread', 'resolved', 'resolvedAt']);
+        }
+      }
+
+      match /drafts/{draftId} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow create, update, delete: if isVerifiedUser() && request.auth.uid == userId;
+      }
+    }
+
+    match /reviewCases/{reviewCaseId} {
+      allow read: if isModerator() || (request.auth != null && request.auth.uid == resource.data.userId);
+      allow create, update, delete: if false;
+    }
+
+    match /uploads/{uploadId} {
+      allow read: if isModerator() || (request.auth != null && request.auth.uid == resource.data.userId);
+      allow create, update, delete: if false;
     }
 
     match /posts/{postId} {
