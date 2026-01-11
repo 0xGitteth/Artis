@@ -7,7 +7,8 @@ service cloud.firestore {
     function isModerator() {
       return request.auth != null
         && request.auth.token.email_verified == true
-        && get(/databases/$(database)/documents/config/moderation).data.moderatorEmails != null
+        && request.auth.token.email != null
+        && exists(/databases/$(database)/documents/config/moderation)
         && request.auth.token.email in get(/databases/$(database)/documents/config/moderation).data.moderatorEmails;
     }
 

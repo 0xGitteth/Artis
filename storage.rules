@@ -5,7 +5,11 @@ service firebase.storage {
       return request.auth != null && request.auth.token.email_verified == true;
     }
     function isModerator() {
-      return request.auth != null && request.auth.token.moderator == true;
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email != null
+        && firestore.exists(/databases/(default)/documents/config/moderation)
+        && request.auth.token.email in firestore.get(/databases/(default)/documents/config/moderation).data.moderatorEmails;
     }
 
     match /uploads/{userId}/{allPaths=**} {
